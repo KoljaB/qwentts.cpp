@@ -85,6 +85,11 @@ int main(void) {
         fprintf(stderr, "[Probe] init_params defaults do not match (use_fa=true, clamp_fp16=false)\n");
         return 1;
     }
+    if (params.onset_silence_ids != NULL || params.onset_silence_id_count != 0 ||
+        params.onset_silence_ban_frames != 0) {
+        fprintf(stderr, "[Probe] onset silence suppression must default to disabled\n");
+        return 1;
+    }
 
     /* Touch every reference-pointer field, every callback typedef and
      * every output struct field so the compiler validates the layout

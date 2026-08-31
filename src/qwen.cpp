@@ -256,6 +256,9 @@ void qt_tts_default_params(struct qt_tts_params * p) {
     p->ref_spk_dim           = 0;
     p->ref_codes             = nullptr;
     p->ref_T                 = 0;
+    p->onset_silence_ids     = nullptr;
+    p->onset_silence_id_count = 0;
+    p->onset_silence_ban_frames = 0;
 }
 
 int qt_num_codebooks(const struct qt_context * q) {
@@ -614,6 +617,48 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
     }
     const bool has_lat_spk   = params->ref_spk_emb && params->ref_spk_dim > 0;
     const bool has_lat_codes = params->ref_codes && params->ref_T > 0;
+    const bool has_ref_audio = params->ref_audio_24k && params->ref_n_samples > 0;
+    const bool onset_requested = params->onset_silence_ids || params->onset_silence_id_count != 0 ||
+                                 params->onset_silence_ban_frames != 0;
+
+    if (onset_requested) {
+        if (!params->onset_silence_ids || params->onset_silence_id_count <= 0 ||
+            params->onset_silence_id_count > 256 || params->onset_silence_ban_frames <= 0 ||
+            params->onset_silence_ban_frames > 16) {
+            qt_set_error("onset silence suppression requires 1..256 IDs and 1..16 frames");
+            if (out) {
+                qt_audio_free(out);
+            }
+            return QT_STATUS_INVALID_PARAMS;
+        }
+        if (mt != "base" || (!has_ref_audio && !has_lat_spk) || params->ref_text || params->ref_codes) {
+            qt_set_error("onset silence suppression is only valid for Base x-vector-only requests");
+            if (out) {
+                qt_audio_free(out);
+            }
+            return QT_STATUS_MODE_INVALID;
+        }
+        for (int i = 0; i < params->onset_silence_id_count; ++i) {
+            const int id = params->onset_silence_ids[i];
+            if (id < 0 || id >= q->pt.code_predictor.vocab_size) {
+                qt_set_error("onset silence ID %d is outside the normal codec vocabulary [0, %d)", id,
+                             q->pt.code_predictor.vocab_size);
+                if (out) {
+                    qt_audio_free(out);
+                }
+                return QT_STATUS_INVALID_PARAMS;
+            }
+            for (int j = 0; j < i; ++j) {
+                if (params->onset_silence_ids[j] == id) {
+                    qt_set_error("onset silence ID %d is duplicated", id);
+                    if (out) {
+                        qt_audio_free(out);
+                    }
+                    return QT_STATUS_INVALID_PARAMS;
+                }
+            }
+        }
+    }
 
     if ((params->ref_audio_24k || has_lat_spk) && mt != "base") {
         qt_set_error("--ref-wav / --ref-spk is only valid for base models (loaded: %s)", mt.c_str());

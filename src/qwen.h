@@ -59,13 +59,13 @@ extern "C" {
 // git short hash + commit date string returned by qt_version(); for
 // binding compat checks, QT_ABI_VERSION is the only number that
 // matters.
-#define QT_ABI_VERSION 4
+#define QT_ABI_VERSION 5
 
 // Oldest struct layout this build addresses. A v3 or older
 // qt_tts_params places its trailing fields at offsets this build does
 // not map, so such a struct is unreadable here and its caller rebuilds
 // against this header.
-#define QT_ABI_MIN_VERSION 4
+#define QT_ABI_MIN_VERSION 5
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -348,6 +348,15 @@ struct qt_tts_params {
     int             ref_spk_dim;
     const int32_t * ref_codes;
     int             ref_T;
+
+    // Optional request-local suppression of known leading-silence c0
+    // tokens. Disabled when all three fields are zero / NULL. When
+    // enabled, the library rejects non-Base, ICL, and non-x-vector
+    // requests instead of silently broadening the rule. The caller owns
+    // onset_silence_ids for the duration of qt_synthesize.
+    const int32_t * onset_silence_ids;
+    int             onset_silence_id_count;
+    int             onset_silence_ban_frames;
 };
 
 // Initialise to the standard defaults. Strings NULL, seed -1,

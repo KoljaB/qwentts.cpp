@@ -1171,10 +1171,33 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         // codec_eos. Then run the upstream sampling chain.
         Timer t_host;
         apply_suppress(s.logits.data(), vocab, vocab - 1024, vocab, codec_eos_id);
+        const bool onset_active = p->onset_silence_ban_frames > 0 && s.step < p->onset_silence_ban_frames;
+        std::vector<float> onset_unmasked_logits;
+        if (onset_active) {
+            onset_unmasked_logits = s.logits;
+        }
         float u_c0 = 0.0f;
         int   c0   = sample_top_k_p(s.logits.data(), vocab, s.talker_T, p->top_k, p->top_p, p->repetition_penalty,
                                     s.talker_history.data(), (int) s.talker_history.size(), s.job->resolved_seed,
                                     s.subseq_counter, &u_c0);
+        bool onset_rejected = false;
+        if (onset_active) {
+            for (int onset_index = 0; onset_index < p->onset_silence_id_count; ++onset_index) {
+                if (c0 == p->onset_silence_ids[onset_index]) {
+                    onset_rejected = true;
+                    break;
+                }
+            }
+        }
+        if (onset_rejected) {
+            s.logits.swap(onset_unmasked_logits);
+            for (int onset_index = 0; onset_index < p->onset_silence_id_count; ++onset_index) {
+                s.logits[(size_t) p->onset_silence_ids[onset_index]] = -INFINITY;
+            }
+            c0 = sample_top_k_p(s.logits.data(), vocab, s.talker_T, p->top_k, p->top_p,
+                                p->repetition_penalty, s.talker_history.data(),
+                                (int) s.talker_history.size(), s.job->resolved_seed, s.subseq_counter, &u_c0);
+        }
         s.perf.host_ms += t_host.ms();
         s.subseq_counter++;
         if (c0 < 0) {
