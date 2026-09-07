@@ -170,6 +170,16 @@ QT_API void qt_init_default_params(struct qt_init_params * p);
 // qt_free.
 QT_API struct qt_context * qt_init(const struct qt_init_params * params);
 
+// Returns 1 only for a library compiled with the CPU-only build profile.
+// This is a capability query; it performs no backend initialization.
+QT_API int qt_cpu_only(void);
+
+// CPU-forced initializer. n_threads must be in [1, 256]. The initializer
+// uses a private CPU backend pair and never reads or mutates backend
+// selection environment variables. The caller must release the handle with
+// qt_free, exactly as for qt_init.
+QT_API struct qt_context * qt_init_cpu(const struct qt_init_params * params, int n_threads);
+
 // Release every module owned by the handle and free the handle itself.
 // Safe on NULL.
 QT_API void qt_free(struct qt_context * q);

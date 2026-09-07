@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "qt-error.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,16 +27,38 @@ struct BackendPair {
 // Physical core count heuristic (logical / 2 for HT/SMT).
 // Used for GGML CPU thread count: GEMM shares SIMD units across hyperthreads,
 // so one thread per physical core is optimal.
+//
+// QWENTTS_CPU_THREADS is intentionally process-scoped and read only while
+// constructing a backend. It is a bounded diagnostic/tuning override, not a
+// public ABI field: malformed, empty, zero, negative, and out-of-range values
+// fall back to the physical-core heuristic.
 static int backend_cpu_n_threads(void) {
     int n = (int) std::thread::hardware_concurrency() / 2;
-    return n > 0 ? n : 1;
+    if (n <= 0) {
+        n = 1;
+    }
+
+    const char * raw = std::getenv("QWENTTS_CPU_THREADS");
+    if (!raw || !*raw) {
+        return n;
+    }
+
+    char * end = nullptr;
+    errno      = 0;
+    long requested = std::strtol(raw, &end, 10);
+    if (errno == 0 && end != raw && *end == '\0' && requested >= 1 && requested <= 256) {
+        return (int) requested;
+    }
+
+    qt_log(QT_LOG_WARN, "[Load] ignoring QWENTTS_CPU_THREADS=%s (expected integer 1..256); using %d", raw, n);
+    return n;
 }
 
 // Standalone CPU backend via Registry API (DL-safe, no ggml-cpu.h needed).
 // Sets thread count via proc address since ggml_backend_cpu_device_init_backend
 // ignores its params string and always defaults to GGML_DEFAULT_N_THREADS (4).
 // Returns NULL on failure.
-static ggml_backend_t cpu_backend_new(int n_threads) {
+static ggml_backend_t cpu_backend_new(int n_threads, bool require_thread_setter = false) {
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     ggml_backend_t     cpu     = NULL;
     if (cpu_dev) {
@@ -50,12 +73,19 @@ static ggml_backend_t cpu_backend_new(int n_threads) {
 
     ggml_backend_dev_t dev = ggml_backend_get_device(cpu);
     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+    bool thread_configured = false;
     if (reg) {
         auto set_fn =
             (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (set_fn) {
             set_fn(cpu, n_threads);
+            thread_configured = true;
         }
+    }
+    if (require_thread_setter && !thread_configured) {
+        qt_log(QT_LOG_ERROR, "[Load] CPU backend cannot prove requested thread count; ggml_backend_set_n_threads unavailable");
+        ggml_backend_free(cpu);
+        return NULL;
     }
     return cpu;
 }
@@ -90,7 +120,7 @@ static void qt_ggml_log(enum ggml_log_level level, const char * text, void * use
     fflush(stderr);
 }
 
-static BackendPair backend_init(const char * label) {
+static void backend_load_all_once(void) {
     // Magic static: log callback install and dynamic backend loading
     // happen exactly once, safe under concurrent qt_init calls.
     static const bool loaded = [] {
@@ -99,6 +129,10 @@ static BackendPair backend_init(const char * label) {
         return true;
     }();
     (void) loaded;
+}
+
+static BackendPair backend_init(const char * label) {
+    backend_load_all_once();
 
     BackendPair bp = {};
 
@@ -147,6 +181,25 @@ static BackendPair backend_init(const char * label) {
     }
     bp.has_gpu = !best_is_cpu;
     qt_log(QT_LOG_INFO, "[Load] %s backend: %s (CPU threads: %d)", label, ggml_backend_name(bp.backend), n_threads);
+    return bp;
+}
+
+// CPU-only initialization for the additive qt_init_cpu ABI. It deliberately
+// bypasses GGML_BACKEND and best-device selection, so it never reads or
+// mutates process environment and cannot accidentally select a GPU backend.
+static BackendPair backend_init_cpu(const char * label, int n_threads) {
+    backend_load_all_once();
+
+    BackendPair bp = {};
+    bp.backend = cpu_backend_new(n_threads, true);
+    bp.cpu_backend = bp.backend;
+    bp.has_gpu = false;
+    if (!bp.backend) {
+        qt_log(QT_LOG_ERROR, "[Load] failed to init CPU backend");
+        return BackendPair{};
+    }
+
+    qt_log(QT_LOG_INFO, "[Load] %s backend: CPU (CPU threads: %d)", label, n_threads);
     return bp;
 }
 

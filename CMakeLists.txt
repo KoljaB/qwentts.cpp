@@ -128,6 +128,21 @@ macro(link_ggml_backends target)
     add_dependencies(${target} version)
 endmacro()
 
+option(QWEN_CPU_ONLY "Build a CPU-only native library and report the capability" OFF)
+if(QWEN_CPU_ONLY)
+    set(QWEN_CPU_ONLY_DEFINE QWEN_CPU_ONLY=1)
+else()
+    set(QWEN_CPU_ONLY_DEFINE QWEN_CPU_ONLY=0)
+endif()
+
+if(QWEN_CPU_ONLY)
+    foreach(accelerator IN ITEMS GGML_CUDA GGML_METAL GGML_VULKAN GGML_SYCL GGML_RPC GGML_BLAS)
+        if(${accelerator})
+            message(FATAL_ERROR "QWEN_CPU_ONLY requires ${accelerator}=OFF")
+        endif()
+    endforeach()
+endif()
+
 # Core library always STATIC : the bundled CLI tools include
 # pipeline-tts.h / pipeline-codec.h / backend.h directly for the tests
 # paths that need every pipeline_* / backend_* symbol resolved without
@@ -142,7 +157,7 @@ add_library(qwen-core STATIC
     src/pipeline-tts.cpp
     src/pipeline-codec.cpp
 )
-target_compile_definitions(qwen-core PUBLIC QWEN_STATIC)
+target_compile_definitions(qwen-core PUBLIC QWEN_STATIC PRIVATE ${QWEN_CPU_ONLY_DEFINE})
 target_include_directories(qwen-core PUBLIC src)
 target_link_libraries(qwen-core PUBLIC ggml)
 link_ggml_backends(qwen-core)
@@ -159,7 +174,7 @@ if(QWEN_SHARED)
         src/pipeline-tts.cpp
         src/pipeline-codec.cpp
     )
-    target_compile_definitions(qwen PRIVATE QWEN_BUILD)
+    target_compile_definitions(qwen PRIVATE QWEN_BUILD ${QWEN_CPU_ONLY_DEFINE})
     set_target_properties(qwen PROPERTIES
         C_VISIBILITY_PRESET       hidden
         CXX_VISIBILITY_PRESET     hidden

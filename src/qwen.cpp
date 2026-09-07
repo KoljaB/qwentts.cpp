@@ -325,16 +325,17 @@ static void qt_batch_worker(qt_context * q) {
     tts_engine_free(e);
 }
 
-struct qt_context * qt_init(const struct qt_init_params * params) {
+static struct qt_context * qt_init_impl(const struct qt_init_params * params, bool force_cpu, int cpu_threads) {
+    const char * entry = force_cpu ? "qt_init_cpu" : "qt_init";
     if (!params || !params->talker_path || !params->codec_path) {
-        qt_set_error("qt_init: params, talker_path or codec_path is NULL");
-        qt_log(QT_LOG_ERROR, "[Qwen] qt_init requires talker_path and codec_path");
+        qt_set_error("%s: params, talker_path or codec_path is NULL", entry);
+        qt_log(QT_LOG_ERROR, "[Qwen] %s requires talker_path and codec_path", entry);
         return nullptr;
     }
     if (params->abi_version > QT_ABI_VERSION || params->abi_version < QT_ABI_MIN_VERSION) {
-        qt_set_error("qt_init: params->abi_version %d outside the supported range [%d, %d]", params->abi_version,
+        qt_set_error("%s: params->abi_version %d outside the supported range [%d, %d]", entry, params->abi_version,
                      QT_ABI_MIN_VERSION, QT_ABI_VERSION);
-        qt_log(QT_LOG_ERROR, "[Qwen] qt_init params struct carries an unsupported ABI (%d, supported [%d, %d])",
+        qt_log(QT_LOG_ERROR, "[Qwen] %s params struct carries an unsupported ABI (%d, supported [%d, %d])", entry,
                params->abi_version, QT_ABI_MIN_VERSION, QT_ABI_VERSION);
         return nullptr;
     }
@@ -342,9 +343,6 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
     qt_log(QT_LOG_INFO, "[Qwen] qwentts.cpp %s", qt_version());
 
     const int max_batch = params->max_batch > 1 ? params->max_batch : 1;
-
-    // The chunk width resolves once here: it is a property of the
-    // handle, read by every buffered decode it runs.
     const float chunk_sec = params->codec_chunk_sec > 0.0f ? params->codec_chunk_sec : QT_CODEC_CHUNK_SEC_DEFAULT;
 
     // new qt_context() value-initialises every field: POD aggregates
@@ -353,28 +351,23 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
     qt_context * q = new qt_context();
     q->max_batch   = max_batch;
 
-    // The load chain runs inside a try block. Any failure deep in the
-    // GGUF reader, the codec load or the LM weight load throws via
-    // qt_throw; the catch funnels every variant into one cleanup via
-    // qt_free, which is idempotent on partial state (NULL-safe sched,
-    // NULL GGUF handles, refcount-correct backend release).
+    // The load chain is identical for qt_init and qt_init_cpu; only the
+    // backend pair differs. Any deep failure unwinds through qt_free.
     try {
-        q->bp = backend_init("Talker");
+        q->bp = force_cpu ? backend_init_cpu("Talker", cpu_threads) : backend_init("Talker");
         if (!q->bp.backend) {
-            qt_throw("qt_init: backend_init failed (no GGML backend available)");
+            qt_throw("%s: backend initialization failed (no GGML backend available)", entry);
         }
 
         if (!pipeline_tts_load(&q->pt, params->talker_path, params->codec_path, q->bp, params->use_fa,
                                params->clamp_fp16, max_batch, chunk_sec)) {
-            qt_throw("qt_init: pipeline_tts_load failed for '%s' / '%s'", params->talker_path, params->codec_path);
+            qt_throw("%s: pipeline_tts_load failed for '%s' / '%s'", entry, params->talker_path, params->codec_path);
         }
 
         // BPE tokenizer payload lives inside the talker GGUF. Load the
-        // base vocab + the qwen3-tts text specials in one shot. The
-        // specials key list matches the keys written by the conversion
-        // script under the qwen3-tts.text.* namespace.
+        // base vocab + the qwen3-tts text specials in one shot.
         if (!load_bpe_from_gguf(&q->tok, params->talker_path)) {
-            qt_throw("qt_init: load_bpe_from_gguf failed for '%s'", params->talker_path);
+            qt_throw("%s: load_bpe_from_gguf failed for '%s'", entry, params->talker_path);
         }
         const char * specials_keys[] = {
             "qwen3-tts.text.im_start_id", "qwen3-tts.text.im_end_id",  "qwen3-tts.text.tts_pad_id",
@@ -388,14 +381,33 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
         return nullptr;
     }
 
-    // Batch mode: one worker thread owns the long lived engine and the
-    // GPU hot loop; qt_synthesize enqueues and blocks on completion.
     if (q->max_batch > 1) {
         q->worker = std::thread(qt_batch_worker, q);
         qt_log(QT_LOG_INFO, "[Qwen] Batch scheduler started (max_batch=%d)", q->max_batch);
     }
 
     return q;
+}
+
+int qt_cpu_only(void) {
+#if defined(QWEN_CPU_ONLY) && QWEN_CPU_ONLY
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+struct qt_context * qt_init(const struct qt_init_params * params) {
+    return qt_init_impl(params, false, 0);
+}
+
+struct qt_context * qt_init_cpu(const struct qt_init_params * params, int n_threads) {
+    if (n_threads < 1 || n_threads > 256) {
+        qt_set_error("qt_init_cpu: n_threads %d outside the supported range [1, 256]", n_threads);
+        qt_log(QT_LOG_ERROR, "[Qwen] qt_init_cpu rejected n_threads=%d (supported [1, 256])", n_threads);
+        return nullptr;
+    }
+    return qt_init_impl(params, true, n_threads);
 }
 
 void qt_free(struct qt_context * q) {
