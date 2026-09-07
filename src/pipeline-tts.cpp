@@ -544,6 +544,15 @@ struct TtsSlot {
     Timer     t_total;
 };
 
+#if defined(QWEN_CPU_ONLY) && QWEN_CPU_ONLY
+// CPU-only builds flush at four codec frames during live streaming. The
+// eight-frame buffers and staging/reference priming remain allocated so the
+// graph shape and ICL conditioning path stay unchanged.
+static const int CODEC_STREAM_MAX_TARGET = 4;
+#else
+static const int CODEC_STREAM_MAX_TARGET = 1 << (CODEC_STREAM_CLASSES - 1);
+#endif
+
 struct TtsEngine {
     PipelineTTS *        pt;
     BPETokenizer *       tok;
@@ -559,6 +568,7 @@ struct TtsEngine {
     // leaving lane's audio is fully dispatched before the swap remove.
     int                  codec_M;          // active streaming lanes
     int                  codec_target;     // current ramp chunk width
+    bool                 codec_target_repeated; // CPU ramp holds width 2 once
     int                  codec_pending_n;  // rows accumulated, < codec_target
     std::vector<int32_t> codec_pending;    // [row][lane][K] frame rows
     std::vector<uint8_t> codec_live;       // per lane: rows are real frames
@@ -575,9 +585,10 @@ TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok) {
     const size_t maxM  = (size_t) pt->max_batch;
     const size_t K     = (size_t) pt->num_code_groups;
     const size_t maxT  = (size_t) (1 << (CODEC_STREAM_CLASSES - 1));
-    e->codec_M         = 0;
-    e->codec_target    = 1;
-    e->codec_pending_n = 0;
+    e->codec_M               = 0;
+    e->codec_target          = 1;
+    e->codec_target_repeated = false;
+    e->codec_pending_n       = 0;
     e->codec_pending.assign(maxT * maxM * K, 0);
     e->codec_live.assign(maxM, 0);
     e->codec_codes.assign(maxT * maxM * K, 0);
@@ -720,9 +731,10 @@ static bool tts_engine_codec_admit(TtsEngine * e, TtsSlot * s) {
         return false;
     }
     s->codec_set       = set;
-    e->codec_M         = set + 1;
-    e->codec_target    = 1;
-    e->codec_pending_n = 0;
+    e->codec_M               = set + 1;
+    e->codec_target          = 1;
+    e->codec_target_repeated = false;
+    e->codec_pending_n       = 0;
     return true;
 }
 
@@ -1405,8 +1417,18 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 ok = tts_engine_codec_flush(e);
             } else if (e->codec_pending_n >= e->codec_target) {
                 ok = tts_engine_codec_flush(e);
-                if (ok && e->codec_target < (1 << (CODEC_STREAM_CLASSES - 1))) {
-                    e->codec_target <<= 1;
+                if (ok && e->codec_target < CODEC_STREAM_MAX_TARGET) {
+#if defined(QWEN_CPU_ONLY) && QWEN_CPU_ONLY
+                    // CPU live playback benefits from one extra 2-frame
+                    // flush: the ramp is 1,2,2,4,4... and then stays at 4.
+                    // GPU builds retain the original 1,2,4,8 cadence.
+                    if (e->codec_target == 2 && !e->codec_target_repeated) {
+                        e->codec_target_repeated = true;
+                    } else
+#endif
+                    {
+                        e->codec_target <<= 1;
+                    }
                 }
             }
         }
