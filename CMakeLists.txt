@@ -226,3 +226,8 @@ target_include_directories(test-abi-c PRIVATE
 )
 target_link_libraries(test-abi-c PRIVATE qwen-core)
 link_ggml_backends(test-abi-c)
+
+# CPU pool ownership and park/resume regression; no model assets required.
+add_executable(test-cpu-backend-pool tests/cpu-backend-pool.cpp)
+target_link_libraries(test-cpu-backend-pool PRIVATE qwen-core)
+link_ggml_backends(test-cpu-backend-pool)

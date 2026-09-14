@@ -281,6 +281,10 @@ static void qt_batch_worker(qt_context * q) {
     std::vector<TtsJob *>        retired;
     std::unique_lock<std::mutex> lk(q->mu);
     for (;;) {
+        {
+            std::lock_guard<std::mutex> gpu(q->gpu_mu);
+            backend_cpu_pool_park(q->bp);
+        }
         q->cv_work.wait(lk, [&] { return q->stop || !q->queue.empty(); });
         if (q->stop && q->queue.empty()) {
             break;
@@ -386,6 +390,7 @@ static struct qt_context * qt_init_impl(const struct qt_init_params * params, bo
         qt_log(QT_LOG_INFO, "[Qwen] Batch scheduler started (max_batch=%d)", q->max_batch);
     }
 
+    backend_cpu_pool_park(q->bp);
     return q;
 }
 
@@ -423,7 +428,7 @@ void qt_free(struct qt_context * q) {
         q->worker.join();
     }
     pipeline_tts_free(&q->pt);
-    backend_release(q->bp.backend, q->bp.cpu_backend);
+    backend_release(q->bp);
     delete q;
 }
 
@@ -479,6 +484,7 @@ enum qt_status qt_extract_voice_ref(struct qt_context *   q,
         // Serialize against the batch worker and any concurrent
         // synthesize: the extraction slips between two engine frames.
         std::lock_guard<std::mutex> gpu(q->gpu_mu);
+        BackendCpuIdleGuard idle{q->bp};
 
         // Lazy residency: the first reference audio request pays the
         // weight load once, mirroring the qt_synthesize ref_audio path.
@@ -707,6 +713,7 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
             // thread under gpu_mu, so concurrent callers serialize FIFO
             // and callbacks fire on their own caller's thread.
             std::lock_guard<std::mutex> gpu(q->gpu_mu);
+            BackendCpuIdleGuard idle{q->bp};
             return pipeline_tts_synthesize(&q->pt, &q->tok, params, resolved_seed, out);
         }
 

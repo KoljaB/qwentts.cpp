@@ -22,6 +22,9 @@ struct BackendPair {
     ggml_backend_t backend;
     ggml_backend_t cpu_backend;
     bool           has_gpu;
+    struct ggml_threadpool * cpu_threadpool = nullptr;
+    void (*cpu_threadpool_free)(struct ggml_threadpool *) = nullptr;
+    void (*cpu_threadpool_attach)(ggml_backend_t, struct ggml_threadpool *) = nullptr;
 };
 
 // Physical core count heuristic (logical / 2 for HT/SMT).
@@ -89,6 +92,46 @@ static ggml_backend_t cpu_backend_new(int n_threads, bool require_thread_setter 
     }
     return cpu;
 }
+
+// Only the owning qt_context releases this pool; pipeline copies borrow it.
+static bool backend_cpu_pool_init(BackendPair & bp, int n_threads) {
+    // Keep one pool for this context. Talker, predictor and codec execute
+    // serially on its shared CPU backend; separate contexts own separate pools.
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(bp.cpu_backend));
+    auto create = reinterpret_cast<struct ggml_threadpool * (*)(struct ggml_threadpool_params *)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new"));
+    auto destroy = reinterpret_cast<void (*)(struct ggml_threadpool *)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free"));
+    auto attach = reinterpret_cast<void (*)(ggml_backend_t, struct ggml_threadpool *)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool"));
+    if (!create || !destroy || !attach) {
+        qt_log(QT_LOG_ERROR, "[Load] CPU backend lacks persistent thread-pool support");
+        return false;
+    }
+    auto pool_params = ggml_threadpool_params_default(n_threads);
+    bp.cpu_threadpool = create(&pool_params);
+    if (!bp.cpu_threadpool) {
+        return false;
+    }
+    bp.cpu_threadpool_free = destroy;
+    bp.cpu_threadpool_attach = attach;
+    attach(bp.cpu_backend, bp.cpu_threadpool);    return true;
+}
+
+// The registry setter parks an old pool when detaching it. Reattach the same
+// paused pool so the next graph wakes it through GGML's ordinary kickoff.
+static void backend_cpu_pool_park(const BackendPair & bp) {
+    if (bp.cpu_threadpool) {
+        bp.cpu_threadpool_attach(bp.cpu_backend, nullptr);
+        bp.cpu_threadpool_attach(bp.cpu_backend, bp.cpu_threadpool);
+    }
+}
+
+// Declare after the context execution lock, so parking precedes its release.
+struct BackendCpuIdleGuard {
+    const BackendPair & bp;
+    ~BackendCpuIdleGuard() { backend_cpu_pool_park(bp); }
+};
 
 // Initialize backends: load all available (CUDA, Metal, Vulkan...),
 // pick the best one, keep CPU as fallback.
@@ -179,6 +222,10 @@ static BackendPair backend_init(const char * label) {
         }
         return BackendPair{};
     }
+    if (best_is_cpu && !backend_cpu_pool_init(bp, n_threads)) {
+        ggml_backend_free(bp.backend);
+        return BackendPair{};
+    }
     bp.has_gpu = !best_is_cpu;
     qt_log(QT_LOG_INFO, "[Load] %s backend: %s (CPU threads: %d)", label, ggml_backend_name(bp.backend), n_threads);
     return bp;
@@ -199,17 +246,27 @@ static BackendPair backend_init_cpu(const char * label, int n_threads) {
         return BackendPair{};
     }
 
+    if (!backend_cpu_pool_init(bp, n_threads)) {
+        ggml_backend_free(bp.backend);
+        return BackendPair{};
+    }
+
     qt_log(QT_LOG_INFO, "[Load] %s backend: CPU (CPU threads: %d)", label, n_threads);
     return bp;
 }
 
 // Free a backend pair returned by backend_init.
-static void backend_release(ggml_backend_t backend, ggml_backend_t cpu_backend) {
+static void backend_release(BackendPair bp) {
+    auto backend = bp.backend;
+    auto cpu_backend = bp.cpu_backend;
     if (backend && backend != cpu_backend) {
         ggml_backend_free(backend);
     }
     if (cpu_backend) {
         ggml_backend_free(cpu_backend);
+    }
+    if (bp.cpu_threadpool) {
+        bp.cpu_threadpool_free(bp.cpu_threadpool);
     }
 }
 
