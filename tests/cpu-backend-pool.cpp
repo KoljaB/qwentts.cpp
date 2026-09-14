@@ -3,6 +3,7 @@
 #include <vector>
 static void require(bool ok) { if (!ok) { std::fprintf(stderr, "CPU pool regression failed\n"); std::exit(1); } }
 static void compute(const BackendPair & bp, float value) {
+    BackendCpuIdleGuard idle{bp};
     ggml_init_params params = { 1024 * 1024, nullptr, true };
     auto ctx = ggml_init(params);
     require(ctx != nullptr);
@@ -24,6 +25,10 @@ static void compute(const BackendPair & bp, float value) {
     ggml_free(ctx);
 }
 int main() {
+#if defined(__linux__)
+    cpu_set_t original;
+    require(sched_getaffinity(0, sizeof(original), &original) == 0);
+#endif
 #ifdef _WIN32
     _putenv_s("QWENTTS_CPU_THREADS", "2");
     _putenv_s("GGML_BACKEND", "CPU");
@@ -40,6 +45,11 @@ int main() {
         backend_release(first);
         compute(second, 5);
         backend_release(second);
+#if defined(__linux__)
+        cpu_set_t after;
+        require(sched_getaffinity(0, sizeof(after), &after) == 0);
+        require(CPU_EQUAL(&original, &after));
+#endif
     }
     std::puts("CPU_POOL_TEST_PASS: independent pools, parked wakeup, surviving context, repeated teardown");
 }

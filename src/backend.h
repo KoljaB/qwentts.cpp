@@ -17,6 +17,9 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 struct BackendPair {
     ggml_backend_t backend;
@@ -93,6 +96,28 @@ static ggml_backend_t cpu_backend_new(int n_threads, bool require_thread_setter 
     return cpu;
 }
 
+// Opt-in placement inside the caller's existing CPU affinity only. A pool
+// barrier must not make runnable workers compete for the same CPU after idle.
+static bool backend_cpu_strict_affinity() {
+    const char * value = std::getenv("QWENTTS_CPU_STRICT_AFFINITY");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+// GGML pins its calling worker on resume. Do not leak that placement into
+// the host's event loop or into a later independently created context.
+struct BackendCpuAffinityGuard {
+#if defined(__linux__)
+    cpu_set_t previous;
+    bool restore = false;
+    BackendCpuAffinityGuard() {
+        restore = backend_cpu_strict_affinity() && sched_getaffinity(0, sizeof(previous), &previous) == 0;
+    }
+    ~BackendCpuAffinityGuard() {
+        if (restore) sched_setaffinity(0, sizeof(previous), &previous);
+    }
+#endif
+};
+
 // Only the owning qt_context releases this pool; pipeline copies borrow it.
 static bool backend_cpu_pool_init(BackendPair & bp, int n_threads) {
     // Keep one pool for this context. Talker, predictor and codec execute
@@ -109,6 +134,28 @@ static bool backend_cpu_pool_init(BackendPair & bp, int n_threads) {
         return false;
     }
     auto pool_params = ggml_threadpool_params_default(n_threads);
+    if (backend_cpu_strict_affinity()) {
+#if defined(__linux__)
+        cpu_set_t allowed;
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return false;
+        int available = 0;
+        for (int cpu = 0; cpu < GGML_MAX_N_THREADS && cpu < CPU_SETSIZE; ++cpu) {
+            pool_params.cpumask[cpu] = CPU_ISSET(cpu, &allowed);
+            available += pool_params.cpumask[cpu] ? 1 : 0;
+        }
+        if (available < n_threads) {
+            qt_log(QT_LOG_ERROR, "[Load] Strict CPU affinity needs %d allowed CPUs, found %d", n_threads, available);
+            return false;
+        }
+        pool_params.strict_cpu = true;
+        pool_params.paused = true;
+        qt_log(QT_LOG_INFO, "[Load] Strict CPU worker affinity enabled inside %d allowed CPUs", available);
+#else
+        qt_log(QT_LOG_ERROR, "[Load] Strict CPU affinity requires Linux");
+        return false;
+#endif
+    }
+
     bp.cpu_threadpool = create(&pool_params);
     if (!bp.cpu_threadpool) {
         return false;
@@ -130,6 +177,7 @@ static void backend_cpu_pool_park(const BackendPair & bp) {
 // Declare after the context execution lock, so parking precedes its release.
 struct BackendCpuIdleGuard {
     const BackendPair & bp;
+    BackendCpuAffinityGuard affinity;
     ~BackendCpuIdleGuard() { backend_cpu_pool_park(bp); }
 };
 

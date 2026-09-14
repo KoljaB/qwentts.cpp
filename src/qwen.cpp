@@ -330,6 +330,7 @@ static void qt_batch_worker(qt_context * q) {
 }
 
 static struct qt_context * qt_init_impl(const struct qt_init_params * params, bool force_cpu, int cpu_threads) {
+    BackendCpuAffinityGuard affinity;
     const char * entry = force_cpu ? "qt_init_cpu" : "qt_init";
     if (!params || !params->talker_path || !params->codec_path) {
         qt_set_error("%s: params, talker_path or codec_path is NULL", entry);
