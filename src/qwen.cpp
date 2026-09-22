@@ -329,7 +329,8 @@ static void qt_batch_worker(qt_context * q) {
     tts_engine_free(e);
 }
 
-static struct qt_context * qt_init_impl(const struct qt_init_params * params, bool force_cpu, int cpu_threads) {
+static struct qt_context * qt_init_impl(const struct qt_init_params * params, bool force_cpu, int cpu_threads,
+                                      const struct qt_cpu_options * options = nullptr) {
     BackendCpuAffinityGuard affinity;
     const char * entry = force_cpu ? "qt_init_cpu" : "qt_init";
     if (!params || !params->talker_path || !params->codec_path) {
@@ -345,6 +346,22 @@ static struct qt_context * qt_init_impl(const struct qt_init_params * params, bo
         return nullptr;
     }
 
+    // Process-level opt-in, read once per CPU context. Preserve the public ABI.
+    bool cpu_startup_priority = false;
+    if (force_cpu) {
+        const char * value = std::getenv("QWENTTS_CPU_STARTUP_PRIORITY");
+        if (value && std::strcmp(value, "off") != 0 && std::strcmp(value, "second_chunk") != 0) {
+            qt_set_error("QWENTTS_CPU_STARTUP_PRIORITY must be off or second_chunk");
+            return nullptr;
+        }
+        cpu_startup_priority = value && std::strcmp(value, "second_chunk") == 0;
+        if (cpu_startup_priority &&
+            (!options || options->codec_threads <= 0 || options->stream_frames == 1)) {
+            qt_set_error("QWENTTS_CPU_STARTUP_PRIORITY=second_chunk requires codec overlap and a 2/4-frame stream");
+            return nullptr;
+        }
+    }
+
     qt_log(QT_LOG_INFO, "[Qwen] qwentts.cpp %s", qt_version());
 
     const int max_batch = params->max_batch > 1 ? params->max_batch : 1;
@@ -355,17 +372,23 @@ static struct qt_context * qt_init_impl(const struct qt_init_params * params, bo
     // BPETokenizer construct empty.
     qt_context * q = new qt_context();
     q->max_batch   = max_batch;
+    q->pt.cpu_startup_priority = cpu_startup_priority;
+    if (cpu_startup_priority) {
+        qt_log(QT_LOG_INFO, "[Qwen] CPU startup priority: second_chunk");
+    }
 
     // The load chain is identical for qt_init and qt_init_cpu; only the
     // backend pair differs. Any deep failure unwinds through qt_free.
     try {
-        q->bp = force_cpu ? backend_init_cpu("Talker", cpu_threads) : backend_init("Talker");
+        q->bp = force_cpu ? backend_init_cpu("Talker", cpu_threads, options ? options->worker_mask : 0) : backend_init("Talker");
         if (!q->bp.backend) {
             qt_throw("%s: backend initialization failed (no GGML backend available)", entry);
         }
 
         if (!pipeline_tts_load(&q->pt, params->talker_path, params->codec_path, q->bp, params->use_fa,
-                               params->clamp_fp16, max_batch, chunk_sec)) {
+                               params->clamp_fp16, max_batch, chunk_sec,
+                               options ? options->codec_threads : 0, options ? options->stream_frames : 0,
+                               options ? options->codec_mask : 0)) {
             qt_throw("%s: pipeline_tts_load failed for '%s' / '%s'", entry, params->talker_path, params->codec_path);
         }
 
@@ -414,6 +437,20 @@ struct qt_context * qt_init_cpu(const struct qt_init_params * params, int n_thre
         return nullptr;
     }
     return qt_init_impl(params, true, n_threads);
+}
+
+struct qt_context * qt_init_cpu_ex(const struct qt_init_params * params, int n_threads,
+                                   const struct qt_cpu_options * options) {
+    if (!options || options->version != 1 || n_threads < 1 || n_threads > 256 ||
+        options->codec_threads < 0 || options->codec_threads > 256 ||
+        (options->stream_frames != 0 && options->stream_frames != 1 &&
+         options->stream_frames != 2 && options->stream_frames != 4) ||
+        (options->codec_mask && !options->codec_threads) ||
+        (params && params->max_batch > 1 && options->codec_threads)) {
+        qt_set_error("qt_init_cpu_ex: invalid CPU scheduling options (overlap requires max_batch=1)");
+        return nullptr;
+    }
+    return qt_init_impl(params, true, n_threads, options);
 }
 
 void qt_free(struct qt_context * q) {
@@ -486,6 +523,7 @@ enum qt_status qt_extract_voice_ref(struct qt_context *   q,
         // synthesize: the extraction slips between two engine frames.
         std::lock_guard<std::mutex> gpu(q->gpu_mu);
         BackendCpuIdleGuard idle{q->bp};
+        BackendCpuIdleGuard codec_idle{q->pt.separate_codec_bp};
 
         // Lazy residency: the first reference audio request pays the
         // weight load once, mirroring the qt_synthesize ref_audio path.
@@ -715,6 +753,7 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
             // and callbacks fire on their own caller's thread.
             std::lock_guard<std::mutex> gpu(q->gpu_mu);
             BackendCpuIdleGuard idle{q->bp};
+            BackendCpuIdleGuard codec_idle{q->pt.separate_codec_bp};
             return pipeline_tts_synthesize(&q->pt, &q->tok, params, resolved_seed, out);
         }
 

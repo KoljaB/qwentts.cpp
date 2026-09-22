@@ -180,6 +180,21 @@ QT_API int qt_cpu_only(void);
 // qt_free, exactly as for qt_init.
 QT_API struct qt_context * qt_init_cpu(const struct qt_init_params * params, int n_threads);
 
+// Optional CPU scheduling. Version must be 1. Zero codec_threads keeps serial
+// execution; 1..256 gives the streaming codec a private pool. stream_frames
+// is 0 (default), 1, 2 or 4. Masks are optional allowed logical CPU bits 0..63,
+// supported on Windows/Linux, and never change the process affinity.
+// Overlap requires max_batch <= 1. Sampling, weights and precision are unchanged.
+struct qt_cpu_options {
+    int version;
+    int codec_threads;
+    int stream_frames;
+    uint64_t worker_mask;
+    uint64_t codec_mask;
+};
+QT_API struct qt_context * qt_init_cpu_ex(const struct qt_init_params * params,
+                                          int n_threads, const struct qt_cpu_options * options);
+
 // Release every module owned by the handle and free the handle itself.
 // Safe on NULL.
 QT_API void qt_free(struct qt_context * q);

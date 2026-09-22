@@ -129,6 +129,9 @@ struct PipelineTTS {
     bool spk_enc_loaded;
 
     PipelineCodec codec;
+    BackendPair   separate_codec_bp = {};
+    int           cpu_stream_frames = 0;
+    bool          cpu_startup_priority = false;
 
     std::string tokenizer_type;
     std::string model_size;
@@ -210,7 +213,10 @@ bool pipeline_tts_load(PipelineTTS * pt,
                        bool          use_fa,
                        bool          clamp_fp16,
                        int           max_batch,
-                       float         codec_chunk_sec);
+                       float         codec_chunk_sec,
+                       int           codec_threads = 0,
+                       int           cpu_stream_frames = 0,
+                       uint64_t      codec_mask = 0);
 
 void pipeline_tts_free(PipelineTTS * pt);
 

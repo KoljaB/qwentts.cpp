@@ -17,6 +17,12 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #if defined(__linux__)
 #include <sched.h>
 #endif
@@ -106,11 +112,20 @@ static bool backend_cpu_strict_affinity() {
 // GGML pins its calling worker on resume. Do not leak that placement into
 // the host's event loop or into a later independently created context.
 struct BackendCpuAffinityGuard {
-#if defined(__linux__)
+#if defined(_WIN32)
+    GROUP_AFFINITY previous;
+    bool restore;
+    BackendCpuAffinityGuard() : previous{}, restore(false) {
+        restore = GetThreadGroupAffinity(GetCurrentThread(), &previous) != 0;
+    }
+    ~BackendCpuAffinityGuard() {
+        if (restore) SetThreadGroupAffinity(GetCurrentThread(), &previous, nullptr);
+    }
+#elif defined(__linux__)
     cpu_set_t previous;
     bool restore = false;
     BackendCpuAffinityGuard() {
-        restore = backend_cpu_strict_affinity() && sched_getaffinity(0, sizeof(previous), &previous) == 0;
+        restore = sched_getaffinity(0, sizeof(previous), &previous) == 0;
     }
     ~BackendCpuAffinityGuard() {
         if (restore) sched_setaffinity(0, sizeof(previous), &previous);
@@ -119,7 +134,7 @@ struct BackendCpuAffinityGuard {
 };
 
 // Only the owning qt_context releases this pool; pipeline copies borrow it.
-static bool backend_cpu_pool_init(BackendPair & bp, int n_threads) {
+static bool backend_cpu_pool_init(BackendPair & bp, int n_threads, uint64_t worker_mask = 0) {
     // Keep one pool for this context. Talker, predictor and codec execute
     // serially on its shared CPU backend; separate contexts own separate pools.
     auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(bp.cpu_backend));
@@ -134,13 +149,38 @@ static bool backend_cpu_pool_init(BackendPair & bp, int n_threads) {
         return false;
     }
     auto pool_params = ggml_threadpool_params_default(n_threads);
-    if (backend_cpu_strict_affinity()) {
+#if defined(_WIN32)
+    if (worker_mask || backend_cpu_strict_affinity()) {
+        DWORD_PTR allowed = 0, system = 0;
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &allowed, &system)) return false;
+        const uint64_t mask = worker_mask ? worker_mask : (uint64_t) allowed;
+        if (!mask || (mask & (uint64_t) allowed) != mask) {
+            qt_log(QT_LOG_ERROR, "[Load] CPU worker mask includes unavailable CPUs");
+            return false;
+        }
+        int available = 0;
+        for (int cpu = 0; cpu < 64 && cpu < GGML_MAX_N_THREADS; ++cpu) {
+            pool_params.cpumask[cpu] = (mask & (1ULL << cpu)) != 0;
+            available += pool_params.cpumask[cpu] ? 1 : 0;
+        }
+        if (available < n_threads) {
+            qt_log(QT_LOG_ERROR, "[Load] CPU worker mask needs %d CPUs, found %d", n_threads, available);
+            return false;
+        }
+        pool_params.strict_cpu = true;
+        pool_params.paused = true;
+        qt_log(QT_LOG_INFO, "[Load] Strict Windows CPU worker affinity: %llx", (unsigned long long) mask);
+    }
+#endif
+    if (worker_mask || backend_cpu_strict_affinity()) {
 #if defined(__linux__)
         cpu_set_t allowed;
         if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return false;
         int available = 0;
         for (int cpu = 0; cpu < GGML_MAX_N_THREADS && cpu < CPU_SETSIZE; ++cpu) {
-            pool_params.cpumask[cpu] = CPU_ISSET(cpu, &allowed);
+            const bool requested = !worker_mask || (cpu < 64 && (worker_mask & (1ULL << cpu)));
+            if (worker_mask && requested && !CPU_ISSET(cpu, &allowed)) return false;
+            pool_params.cpumask[cpu] = requested && CPU_ISSET(cpu, &allowed);
             available += pool_params.cpumask[cpu] ? 1 : 0;
         }
         if (available < n_threads) {
@@ -150,8 +190,8 @@ static bool backend_cpu_pool_init(BackendPair & bp, int n_threads) {
         pool_params.strict_cpu = true;
         pool_params.paused = true;
         qt_log(QT_LOG_INFO, "[Load] Strict CPU worker affinity enabled inside %d allowed CPUs", available);
-#else
-        qt_log(QT_LOG_ERROR, "[Load] Strict CPU affinity requires Linux");
+#elif !defined(_WIN32)
+        qt_log(QT_LOG_ERROR, "[Load] Strict CPU affinity requires Linux or Windows");
         return false;
 #endif
     }
@@ -282,7 +322,7 @@ static BackendPair backend_init(const char * label) {
 // CPU-only initialization for the additive qt_init_cpu ABI. It deliberately
 // bypasses GGML_BACKEND and best-device selection, so it never reads or
 // mutates process environment and cannot accidentally select a GPU backend.
-static BackendPair backend_init_cpu(const char * label, int n_threads) {
+static BackendPair backend_init_cpu(const char * label, int n_threads, uint64_t worker_mask = 0) {
     backend_load_all_once();
 
     BackendPair bp = {};
@@ -294,7 +334,7 @@ static BackendPair backend_init_cpu(const char * label, int n_threads) {
         return BackendPair{};
     }
 
-    if (!backend_cpu_pool_init(bp, n_threads)) {
+    if (!backend_cpu_pool_init(bp, n_threads, worker_mask)) {
         ggml_backend_free(bp.backend);
         return BackendPair{};
     }

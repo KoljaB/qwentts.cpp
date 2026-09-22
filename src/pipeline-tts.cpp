@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
+#include <memory>
 
 static void parse_codec_specials(const GGUFModel & gf, CodecSpecials & cs) {
     cs.pad_id       = (int) gf_get_u32(gf, "qwen3-tts.codec.pad_id");
@@ -152,7 +154,10 @@ bool pipeline_tts_load(PipelineTTS * pt,
                        bool          use_fa,
                        bool          clamp_fp16,
                        int           max_batch,
-                       float         codec_chunk_sec) {
+                       float         codec_chunk_sec,
+                       int           codec_threads,
+                       int           cpu_stream_frames,
+                       uint64_t      codec_mask) {
     pt->bp                  = bp;
     pt->backend             = bp.backend;
     pt->sched               = NULL;
@@ -161,6 +166,7 @@ bool pipeline_tts_load(PipelineTTS * pt,
     pt->bridge_buf          = NULL;
     pt->hidden_bridge       = NULL;
     pt->max_batch           = max_batch > 1 ? max_batch : 1;
+    pt->cpu_stream_frames   = cpu_stream_frames;
 
     // Chunk width of the buffered decode. The conversion is a fixed
     // 12.5 Hz ratio, so it lands here once instead of per synthesis.
@@ -215,7 +221,16 @@ bool pipeline_tts_load(PipelineTTS * pt,
     pt->has_speaker_encoder = (pt->model_type == "base");
     pt->spk_enc_loaded      = false;
 
-    if (!pipeline_codec_load(&pt->codec, codec_gguf_path, bp)) {
+    // A separate backend lets the codec decode the previous chunk while the
+    // talker and predictor generate the next. Each pool has exclusive ownership.
+    BackendPair codec_bp = bp;
+    if (codec_threads) {
+        if (bp.has_gpu || pt->max_batch != 1) qt_throw("CPU codec overlap requires CPU max_batch=1");
+        pt->separate_codec_bp = backend_init_cpu("Codec overlap", codec_threads, codec_mask);
+        if (!pt->separate_codec_bp.backend) qt_throw("Cannot initialize the independent CPU codec backend");
+        codec_bp = pt->separate_codec_bp;
+    }
+    if (!pipeline_codec_load(&pt->codec, codec_gguf_path, codec_bp)) {
         code_predictor_weights_free(&pt->code_predictor);
         talker_weights_free(&pt->talker);
         gf_close(&pt->gguf_talker);
@@ -225,6 +240,7 @@ bool pipeline_tts_load(PipelineTTS * pt,
     // reference priming; must land before the first stream call, which
     // allocates the [t, c, S] state tensors from it.
     pt->codec.stream_sets = pt->max_batch + 1;
+    if (pt->separate_codec_bp.backend) backend_cpu_pool_park(pt->separate_codec_bp);
 
     // Left context of the buffered chunked decode. Two decoder windows
     // warm the transformer attention and the causal conv stack deep
@@ -388,6 +404,10 @@ void pipeline_tts_free(PipelineTTS * pt) {
         pt->sched = NULL;
     }
     pipeline_codec_free(&pt->codec);
+    if (pt->separate_codec_bp.backend) {
+        backend_release(pt->separate_codec_bp);
+        pt->separate_codec_bp = {};
+    }
     if (pt->spk_enc_loaded) {
         speaker_encoder_weights_free(&pt->speaker_encoder);
         pt->spk_enc_loaded = false;
@@ -553,7 +573,14 @@ static const int CODEC_STREAM_MAX_TARGET = 4;
 static const int CODEC_STREAM_MAX_TARGET = 1 << (CODEC_STREAM_CLASSES - 1);
 #endif
 
+struct CpuCodecResult {
+    bool ok = false;
+    double ms = 0.0;
+    std::vector<float> audio;
+};
+
 struct TtsEngine {
+    std::future<CpuCodecResult> codec_future;
     PipelineTTS *        pt;
     BPETokenizer *       tok;
     std::vector<TtsSlot> slots;
@@ -567,6 +594,7 @@ struct TtsEngine {
     // latency; a retirement drains the pending rows first so the
     // leaving lane's audio is fully dispatched before the swap remove.
     int                  codec_M;          // active streaming lanes
+    int                  codec_max_target = CODEC_STREAM_MAX_TARGET;
     int                  codec_target;     // current ramp chunk width
     bool                 codec_target_repeated; // CPU ramp holds width 2 once
     int                  codec_pending_n;  // rows accumulated, < codec_target
@@ -581,6 +609,9 @@ TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok) {
     TtsEngine * e      = new TtsEngine();
     e->pt              = pt;
     e->tok             = tok;
+    if (!pt->bp.has_gpu && pt->cpu_stream_frames) {
+        e->codec_max_target = pt->cpu_stream_frames;
+    }
     e->next_serial     = 0;
     const size_t maxM  = (size_t) pt->max_batch;
     const size_t K     = (size_t) pt->num_code_groups;
@@ -599,6 +630,7 @@ TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok) {
 }
 
 void tts_engine_free(TtsEngine * e) {
+    if (e->codec_future.valid()) e->codec_future.wait();
     delete e;
 }
 
@@ -615,6 +647,29 @@ static TtsSlot * tts_engine_codec_lane_slot(TtsEngine * e, int m) {
     return nullptr;
 }
 
+// A single in-flight codec job owns its input/output buffers. Join it before
+// changing codec state or retiring its caller; no task can outlive the engine.
+static bool tts_engine_codec_collect(TtsEngine * e) {
+    if (!e->codec_future.valid()) return true;
+    if (e->codec_future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        backend_cpu_pool_park(e->pt->bp);
+    }
+    CpuCodecResult result = e->codec_future.get();
+    TtsSlot * s = tts_engine_codec_lane_slot(e, 0);
+    if (s) {
+        s->perf.codec_ms += result.ms;
+        if (result.ok && !result.audio.empty() && s->fin_status != QT_STATUS_CANCELLED) {
+            const qt_tts_params * p = s->job->params;
+            backend_cpu_pool_park(e->pt->bp);
+            if (!p->on_chunk(result.audio.data(), (int) result.audio.size(), p->on_chunk_user_data)) {
+                s->finished = true;
+                s->fin_status = QT_STATUS_CANCELLED;
+            }
+        }
+    }
+    return result.ok;
+}
+
 // Drain the shared pending rows through greedy width classes: one
 // batched graph compute decodes all codec_M lanes per chunk, then each
 // lane's samples go to its slot's on_chunk. A cancelled slot or a lane
@@ -623,6 +678,7 @@ static TtsSlot * tts_engine_codec_lane_slot(TtsEngine * e, int m) {
 // batched talker and predictor spans. Returns false only on a decode
 // failure; a callback cancel marks the slot and the flush carries on.
 static bool tts_engine_codec_flush(TtsEngine * e) {
+    if (!tts_engine_codec_collect(e)) return false;
     PipelineTTS * pt  = e->pt;
     const int     M   = e->codec_M;
     const int     K   = pt->num_code_groups;
@@ -649,7 +705,28 @@ static bool tts_engine_codec_flush(TtsEngine * e) {
                 want ? e->codec_audio.data() + (size_t) m * (size_t) (1 << (CODEC_STREAM_CLASSES - 1)) * (size_t) hop :
                        nullptr;
         }
-        if (!pipeline_codec_decode_stream_batch(&pt->codec, e->codec_codes.data(), T, M, e->codec_outs.data())) {
+        if (pt->separate_codec_bp.backend && M == 1) {
+            if (!tts_engine_codec_collect(e)) return false;
+            const bool want = e->codec_outs[0] != nullptr;
+            std::vector<int32_t> codes(e->codec_codes.begin(), e->codec_codes.begin() + (size_t) K * T);
+            e->codec_future = std::async(std::launch::async,
+                [pt, want, T, hop, codes = std::move(codes)]() {
+                    Timer timer;
+                    BackendCpuIdleGuard idle{pt->separate_codec_bp};
+                    CpuCodecResult result;
+                    if (want) result.audio.resize((size_t) T * hop);
+                    float * out = want ? result.audio.data() : nullptr;
+                    result.ok = pipeline_codec_decode_stream_batch(&pt->codec, codes.data(), T, 1, &out);
+                    result.ms = timer.ms();
+                    return result;
+                });
+            // Opt-in startup latency preference: let the second block decode
+            // while generation workers are parked, then resume normal overlap.
+            // Collection keeps callbacks and pause acknowledgement on this thread.
+            if (pt->cpu_startup_priority && T == 2 && e->slots[0].step == 3) {
+                if (!tts_engine_codec_collect(e)) return false;
+            }
+        } else if (!pipeline_codec_decode_stream_batch(&pt->codec, e->codec_codes.data(), T, M, e->codec_outs.data())) {
             return false;
         }
         e->codec_pending_n -= T;
@@ -658,7 +735,7 @@ static bool tts_engine_codec_flush(TtsEngine * e) {
                          (size_t) e->codec_pending_n * (size_t) M * (size_t) K * sizeof(int32_t));
         }
         for (int m = 0; m < M; m++) {
-            if (!e->codec_outs[(size_t) m]) {
+            if (!e->codec_outs[(size_t) m] || pt->separate_codec_bp.backend) {
                 continue;
             }
             TtsSlot *                    s = tts_engine_codec_lane_slot(e, m);
@@ -670,7 +747,7 @@ static bool tts_engine_codec_flush(TtsEngine * e) {
             }
         }
     }
-    const double ms = t_codec.ms();
+    const double ms = pt->separate_codec_bp.backend ? 0.0 : t_codec.ms();
     for (int m = 0; m < M; m++) {
         TtsSlot * s = tts_engine_codec_lane_slot(e, m);
         if (s) {
@@ -688,8 +765,10 @@ static bool tts_engine_codec_flush(TtsEngine * e) {
 // snapshot device to device, or primes through the staging set in max
 // width chunks with the audio discarded and snapshots it for reuse.
 static bool tts_engine_codec_admit(TtsEngine * e, TtsSlot * s) {
+    if (!tts_engine_codec_collect(e)) return false;
     PipelineTTS *   pt = e->pt;
     PipelineCodec * pc = &pt->codec;
+    BackendCpuIdleGuard codec_idle{pt->separate_codec_bp};
     const int       K  = pt->num_code_groups;
     if (e->codec_pending_n > 0 && !tts_engine_codec_flush(e)) {
         return false;
@@ -974,6 +1053,7 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
 // perf accounting, job status and worker side error capture. The codec
 // stream mirror releases here.
 static void tts_slot_complete(TtsEngine * e, TtsSlot & s) {
+    if (!tts_engine_codec_collect(e)) s.fin_status = QT_STATUS_GENERATE_FAILED;
     PipelineTTS *                pt     = e->pt;
     TtsJob *                     job    = s.job;
     const struct qt_tts_params * params = job->params;
@@ -1159,6 +1239,18 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         }
     }
 
+    // Dispatch completed audio only on the generation thread. Callback pause
+    // acknowledgement must never race another in-flight native computation.
+    if (e->codec_future.valid() &&
+        e->codec_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        if (!tts_engine_codec_collect(e)) {
+            for (TtsSlot & s : e->slots) {
+                s.finished = true;
+                s.fin_status = QT_STATUS_GENERATE_FAILED;
+            }
+        }
+    }
+
     // 2) Cancel poll and per slot c0 sampling: suppression, repetition
     // penalty over the slot's own history, its own Philox stream.
     for (int i = 0; i < N; i++) {
@@ -1169,10 +1261,12 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         }
         const struct qt_tts_params * p = s.job->params;
 
-        // Cooperative cancellation, polled at every step. Granularity is
-        // one AR frame = 1 / 12.5 Hz ~ 83 ms of audio, which is well
-        // below any reasonable UX cancel latency target.
-        if (p->cancel && p->cancel(p->cancel_user_data)) {
+        // Poll only at a quiescent checkpoint: overlap may defer the poll
+        // until the current codec chunk completes, never past its next flush.
+        if (!e->codec_future.valid() && p->cancel && pt->separate_codec_bp.backend) {
+            backend_cpu_pool_park(pt->bp);
+        }
+        if (!e->codec_future.valid() && p->cancel && p->cancel(p->cancel_user_data)) {
             qt_log(QT_LOG_INFO, "[Pipeline] cancelled at step %d (slot %d)", s.step, i);
             s.finished   = true;
             s.fin_status = QT_STATUS_CANCELLED;
@@ -1417,7 +1511,7 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
                 ok = tts_engine_codec_flush(e);
             } else if (e->codec_pending_n >= e->codec_target) {
                 ok = tts_engine_codec_flush(e);
-                if (ok && e->codec_target < CODEC_STREAM_MAX_TARGET) {
+                if (ok && e->codec_target < e->codec_max_target) {
 #if defined(QWEN_CPU_ONLY) && QWEN_CPU_ONLY
                     // CPU live playback benefits from one extra 2-frame
                     // flush: the ramp is 1,2,2,4,4... and then stays at 4.
@@ -1488,6 +1582,7 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
                                   int64_t                      resolved_seed,
                                   struct qt_audio *            out) {
     TtsEngine * e = tts_engine_new(pt, tok);
+    std::unique_ptr<TtsEngine, decltype(&tts_engine_free)> lifetime(e, tts_engine_free);
     TtsJob      job;
     job.params        = params;
     job.resolved_seed = resolved_seed;
@@ -1499,6 +1594,5 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
             tts_engine_step(e, NULL);
         }
     }
-    tts_engine_free(e);
     return job.status;
 }
