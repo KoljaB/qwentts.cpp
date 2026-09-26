@@ -162,8 +162,9 @@ struct PipelineTTS {
     ggml_backend_sched_t sched;
 
     // Attention path config, set at load and forwarded to every
-    // talker / code predictor forward. use_flash_attn collapses to
-    // false on CPU only backends (fused FA needs a GPU kernel).
+    // talker / code predictor forward. CPU defaults to the manual path;
+    // QWENTTS_CPU_FLASH_ATTN=1 enables the experimental fused path when
+    // use_fa was requested. This is fixed for the lifetime of the context.
     // clamp_fp16 inserts ggml_clamp on V before attention and on the
     // residual stream between blocks to guard FP16 matmul accumulation
     // on sub Ampere CUDA targets.

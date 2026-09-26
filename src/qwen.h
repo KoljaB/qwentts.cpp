@@ -119,8 +119,10 @@ struct qt_context;
 // codec GGUF holds the 12 Hz audio tokenizer. abi_version stays first
 // so a future struct growth keeps reading the version field at offset
 // 0. use_fa enables fused flash attention in the Talker and Code
-// Predictor forwards when a GPU backend is present (CPU always uses the
-// F32 manual chain); clamp_fp16 inserts ggml_clamp(-65504, 65504) on V
+// Predictor forwards when a GPU backend is present. CPU uses the F32
+// manual chain by default; QWENTTS_CPU_FLASH_ATTN=1 opts into the experimental
+// fused CPU path at initialization. use_fa=false disables either fused path.
+// clamp_fp16 inserts ggml_clamp(-65504, 65504) on V
 // before attention and on the residual stream between blocks to guard
 // FP16 matmul accumulation on sub Ampere CUDA targets.
 struct qt_init_params {

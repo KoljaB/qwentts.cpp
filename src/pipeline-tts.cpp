@@ -172,11 +172,15 @@ bool pipeline_tts_load(PipelineTTS * pt,
     // 12.5 Hz ratio, so it lands here once instead of per synthesis.
     pt->codec_chunk_frames = pipeline_tts_duration_sec_to_tokens(pt, codec_chunk_sec);
 
-    // Fused flash attention needs a GPU kernel; CPU only backends fall
-    // back to the F32 manual chain automatically. clamp_fp16 is forwarded
-    // verbatim: a no op on backends that already accumulate in F32, an
-    // FP16 overflow guard on sub Ampere CUDA tensor cores.
-    pt->use_flash_attn = use_fa && bp.has_gpu;
+    // CPU keeps the manual F32 chain unless explicitly opted into the
+    // experimental fused path. clamp_fp16 is forwarded verbatim: a no op
+    // on backends that already accumulate in F32, an FP16 overflow guard
+    // on sub Ampere CUDA tensor cores.
+    // Experimental CPU path; the installed/release behavior remains the default.
+    const char * cpu_fa = std::getenv("QWENTTS_CPU_FLASH_ATTN");
+    const bool cpu_fa_enabled = !bp.has_gpu && cpu_fa && std::strcmp(cpu_fa, "1") == 0;
+    pt->use_flash_attn = use_fa && (bp.has_gpu || cpu_fa_enabled);
+    if (cpu_fa_enabled) qt_log(QT_LOG_INFO, "[Experimental] CPU fused attention requested");
     pt->clamp_fp16     = clamp_fp16;
 
     if (!gf_load(&pt->gguf_talker, talker_gguf_path)) {
