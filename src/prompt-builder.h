@@ -767,9 +767,9 @@ static bool prompt_builder_build(PipelineTTS *         pt,
 
     out->tts_pad_embed = tts_pad_emb;
 
-    fprintf(stderr,
+    qt_log(QT_LOG_INFO,
             "[Prompt] Built: %d ids, N_text=%d, N_instruct=%d, T_ctx=%d, hidden=%d, lang=%s (id=%d), speaker=%s "
-            "(id=%d) ref_spk_emb=%s icl=%s\n",
+            "(id=%d) ref_spk_emb=%s icl=%s",
             N, N_text, N_instruct, T_ctx, hidden, language.c_str(), language_id,
             speaker_name.empty() ? "none" : speaker_name.c_str(), speaker_id, ref_spk_emb ? "yes" : "no",
             icl ? "yes" : "no");
