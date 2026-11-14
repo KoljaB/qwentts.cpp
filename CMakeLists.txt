@@ -231,3 +231,9 @@ link_ggml_backends(test-abi-c)
 add_executable(test-cpu-backend-pool tests/cpu-backend-pool.cpp)
 target_link_libraries(test-cpu-backend-pool PRIVATE qwen-core)
 link_ggml_backends(test-cpu-backend-pool)
+
+# Needs a Base talker and codec GGUF: test-icl-prefix-cache <talker> <codec> [cpu_threads]
+add_executable(test-icl-prefix-cache tests/icl-prefix-cache.cpp)
+target_include_directories(test-icl-prefix-cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test-icl-prefix-cache PRIVATE qwen-core)
+link_ggml_backends(test-icl-prefix-cache)

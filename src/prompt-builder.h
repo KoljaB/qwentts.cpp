@@ -79,6 +79,13 @@ struct PromptBuilderOutput {
 
     // Length of the text segment used as utterance text, ie input_id[3:-5].
     int N_text;
+
+    // ICL only: number of leading rows that depend on the voice alone
+    // (head plus the rows carrying the reference text). 0 when the
+    // request has no such prefix or the ICL prefix cache is off. The
+    // talker keeps the KV rows of this prefix per voice, see
+    // IclPrefixEntry in pipeline-tts.h.
+    int icl_prefix_rows = 0;
 };
 
 // Convert one row of an embedding matrix W [vocab, dim] to f32. Uses the
@@ -575,8 +582,9 @@ static bool prompt_builder_build(PipelineTTS *         pt,
     // ICL layout         : N_instruct + 3 (role) + (n_pad_pre + 1) + icl_T
     const int T_ctx =
         icl ? (N_instruct + 3 + (n_pad_pre + 1) + icl_T) : (N_instruct + 3 + (n_pad_pre + 1) + N_text + 1 + 1);
-    out->T_ctx  = T_ctx;
-    out->hidden = hidden;
+    out->T_ctx           = T_ctx;
+    out->icl_prefix_rows = 0;
+    out->hidden          = hidden;
     out->input_embed.assign((size_t) T_ctx * (size_t) hidden, 0.0f);
     out->N_text = N_text;
 
@@ -739,6 +747,12 @@ static bool prompt_builder_build(PipelineTTS *         pt,
             float * r = row_ptr(row + i);
             std::memcpy(r, aligned_text.data() + (size_t) i * (size_t) hidden, (size_t) hidden * sizeof(float));
             vec_add(r, codec_stream.data() + (size_t) i * (size_t) hidden, hidden);
+        }
+        // The head rows and the rows whose text stream carries the
+        // reference text do not depend on the utterance: same voice,
+        // same rows. Mark them for the talker KV prefix cache.
+        if (pt->icl_prefix_cache_max > 0 && N_ref_text > 0 && N_ref_text < T_icl) {
+            out->icl_prefix_rows = row + N_ref_text;
         }
         row += T_icl;
     }

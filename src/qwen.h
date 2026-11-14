@@ -408,6 +408,29 @@ QT_API int qt_num_codebooks(const struct qt_context * q);
 // cause and leaves `out` empty.
 QT_API enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params * params, struct qt_audio * out);
 
+// ICL prefix cache for voice cloning with a reference text (ref_text plus
+// ref_codes or ref_audio_24k). The first rows of such a prompt, the head
+// and the rows carrying the reference text, depend on the voice alone.
+// With the cache on, the talker keeps their KV rows on the host after the
+// first request of a voice and later requests of that voice prefill only
+// the remaining rows. A cached prefix is used only when the new prompt's
+// prefix equals it bit for bit, so the audio is the same as without the
+// cache. max_entries is the number of voices kept, least recently used
+// dropped first; 0 turns the cache off and frees it (the default), the
+// valid range is [0, 256]. Each entry holds
+// 2 * layers * kv_heads * head_dim * prefix_rows floats.
+// Returns QT_STATUS_OK, or QT_STATUS_INVALID_PARAMS for a NULL handle or
+// a value out of range. Safe to call between requests from any thread.
+// Present since 2026-11 without an ABI version change: callers that
+// load the library dynamically probe for the symbol.
+QT_API enum qt_status qt_set_icl_prefix_cache(struct qt_context * q, int max_entries);
+
+// Counters of the ICL prefix cache since qt_init: requests that reused a
+// cached prefix and requests that computed and stored one. Any pointer
+// may be NULL. Returns the number of voices currently cached, 0 on a
+// NULL handle.
+QT_API int qt_icl_prefix_cache_stats(struct qt_context * q, uint64_t * hits, uint64_t * misses);
+
 // Convert a duration in seconds to a frame count using the codec
 // frame rate (24000 / TOKENIZER_HOP_LENGTH = 12.5 Hz).
 // Clamps to a minimum of one frame.

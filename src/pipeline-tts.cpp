@@ -18,6 +18,7 @@
 #include "talker-forward.h"
 #include "timer.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -821,6 +822,50 @@ static bool tts_engine_codec_admit(TtsEngine * e, TtsSlot * s) {
     return true;
 }
 
+// ---- ICL prefix cache (PipelineTTS::icl_prefix_cache) ----
+// Rows [0, rows) of every KV head are contiguous in the per set 3D view
+// [head_dim, max_seq_len, n_kv]: one get/set per head.
+static void icl_prefix_io(KVCache * kv, int set, IclPrefixEntry & e, bool store) {
+    const size_t head_elems = (size_t) kv->head_dim * (size_t) e.rows;
+    const size_t head_bytes = head_elems * sizeof(float);
+    if (store) {
+        e.k.assign((size_t) kv->n_layers, std::vector<float>((size_t) kv->n_kv_heads * head_elems));
+        e.v.assign((size_t) kv->n_layers, std::vector<float>((size_t) kv->n_kv_heads * head_elems));
+    }
+    for (int l = 0; l < kv->n_layers; l++) {
+        struct ggml_tensor * kt = kv_cache_k(kv, set, l);
+        struct ggml_tensor * vt = kv_cache_v(kv, set, l);
+        for (int h = 0; h < kv->n_kv_heads; h++) {
+            const size_t off = (size_t) h * kt->nb[2];
+            float *      kd  = e.k[(size_t) l].data() + (size_t) h * head_elems;
+            float *      vd  = e.v[(size_t) l].data() + (size_t) h * head_elems;
+            if (store) {
+                ggml_backend_tensor_get(kt, kd, off, head_bytes);
+                ggml_backend_tensor_get(vt, vd, off, head_bytes);
+            } else {
+                ggml_backend_tensor_set(kt, kd, off, head_bytes);
+                ggml_backend_tensor_set(vt, vd, off, head_bytes);
+            }
+        }
+    }
+}
+
+// Entry whose prefix equals the first `rows` rows of input_embed bit for
+// bit, moved to the most recently used position. NULL when there is none.
+static IclPrefixEntry * icl_prefix_find(PipelineTTS * pt, const float * input_embed, int rows, int hidden) {
+    std::vector<IclPrefixEntry> & cache = pt->icl_prefix_cache;
+    const size_t                  bytes = (size_t) rows * (size_t) hidden * sizeof(float);
+    for (size_t i = 0; i < cache.size(); i++) {
+        if (cache[i].rows == rows && std::memcmp(cache[i].input_embed.data(), input_embed, bytes) == 0) {
+            if (i + 1 != cache.size()) {
+                std::rotate(cache.begin() + (std::ptrdiff_t) i, cache.begin() + (std::ptrdiff_t) i + 1, cache.end());
+            }
+            return &cache.back();
+        }
+    }
+    return NULL;
+}
+
 static bool tts_admit_fail(TtsJob * job, qt_status st) {
     job->status = st;
     job->error  = qt_last_error();
@@ -1035,9 +1080,48 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     // measured span is the batch's join cost.
     TalkerForwardOutput fw;
     Timer               t_prefill;
-    if (!talker_forward_prefill(&pt->talker, &pt->talker_kv, slot_idx, pt->sched, &pt->talker_arena, pt->hidden_bridge,
-                                s.prompt.input_embed.data(), s.prompt.T_ctx, pt->use_flash_attn, pt->clamp_fp16,
-                                params->dump_dir, &fw)) {
+    // ICL prefix cache: the voice only rows come back from the host copy
+    // and only the remaining rows run through the talker. The restored
+    // rows are the ones a full prefill computes, so the result is the
+    // same. A debug dump always runs the full prefill.
+    bool             prefill_ok   = false;
+    const int        prefix_rows  = s.prompt.icl_prefix_rows;
+    const bool       prefix_cache = pt->icl_prefix_cache_max > 0 && prefix_rows > 0 && prefix_rows < s.prompt.T_ctx &&
+                                    prefix_rows <= pt->talker_kv.max_seq_len && !params->dump_dir;
+    IclPrefixEntry * prefix_hit =
+        prefix_cache ? icl_prefix_find(pt, s.prompt.input_embed.data(), prefix_rows, s.prompt.hidden) : NULL;
+    if (prefix_hit) {
+        icl_prefix_io(&pt->talker_kv, slot_idx, *prefix_hit, /*store=*/false);
+        pt->talker_kv.cur_len[(size_t) slot_idx] = prefix_rows;
+        prefill_ok = talker_forward_core(&pt->talker, &pt->talker_kv, slot_idx, pt->sched, &pt->talker_arena,
+                                         pt->hidden_bridge,
+                                         s.prompt.input_embed.data() + (size_t) prefix_rows * (size_t) s.prompt.hidden,
+                                         s.prompt.T_ctx - prefix_rows, prefix_rows, pt->use_flash_attn, pt->clamp_fp16,
+                                         false, NULL, &fw);
+        pt->icl_prefix_hits++;
+    } else {
+        prefill_ok = talker_forward_prefill(&pt->talker, &pt->talker_kv, slot_idx, pt->sched, &pt->talker_arena,
+                                            pt->hidden_bridge, s.prompt.input_embed.data(), s.prompt.T_ctx,
+                                            pt->use_flash_attn, pt->clamp_fp16, params->dump_dir, &fw);
+        if (prefill_ok && prefix_cache) {
+            while ((int) pt->icl_prefix_cache.size() >= pt->icl_prefix_cache_max) {
+                pt->icl_prefix_cache.erase(pt->icl_prefix_cache.begin());
+            }
+            IclPrefixEntry entry;
+            entry.rows = prefix_rows;
+            entry.input_embed.assign(s.prompt.input_embed.begin(),
+                                     s.prompt.input_embed.begin() +
+                                         (std::ptrdiff_t) ((size_t) prefix_rows * (size_t) s.prompt.hidden));
+            icl_prefix_io(&pt->talker_kv, slot_idx, entry, /*store=*/true);
+            pt->icl_prefix_cache.push_back(std::move(entry));
+            pt->icl_prefix_misses++;
+        }
+    }
+    if (prefix_cache) {
+        qt_log(QT_LOG_INFO, "[IclPrefix] %s rows=%d of T_ctx=%d", prefix_hit ? "hit" : "miss, stored", prefix_rows,
+               s.prompt.T_ctx);
+    }
+    if (!prefill_ok) {
         // The lane just attached is the tail one; dropping it needs no
         // compaction.
         if (s.codec_set >= 0) {

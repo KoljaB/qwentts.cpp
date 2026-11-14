@@ -211,6 +211,16 @@ int main(void) {
         return 10;
     }
 
+    /* ICL prefix cache entries resolve and reject a NULL handle. */
+    if (qt_set_icl_prefix_cache(NULL, 4) != QT_STATUS_INVALID_PARAMS) {
+        fprintf(stderr, "[Probe] qt_set_icl_prefix_cache(NULL) must be rejected\n");
+        return 11;
+    }
+    if (qt_icl_prefix_cache_stats(NULL, NULL, NULL) != 0) {
+        fprintf(stderr, "[Probe] qt_icl_prefix_cache_stats(NULL) must be 0\n");
+        return 12;
+    }
+
     /* Restore the default stderr fallback before exit so the trailing
      * [Qwen] log lines from the cleanup paths land where the user
      * expects them. */

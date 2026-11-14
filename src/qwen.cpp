@@ -470,6 +470,34 @@ void qt_free(struct qt_context * q) {
     delete q;
 }
 
+enum qt_status qt_set_icl_prefix_cache(struct qt_context * q, int max_entries) {
+    if (!q || max_entries < 0 || max_entries > 256) {
+        qt_set_error("qt_set_icl_prefix_cache: NULL handle or max_entries outside [0, 256]");
+        return QT_STATUS_INVALID_PARAMS;
+    }
+    std::lock_guard<std::mutex> gpu(q->gpu_mu);
+    q->pt.icl_prefix_cache_max = max_entries;
+    while ((int) q->pt.icl_prefix_cache.size() > max_entries) {
+        q->pt.icl_prefix_cache.erase(q->pt.icl_prefix_cache.begin());
+    }
+    if (max_entries == 0) {
+        q->pt.icl_prefix_cache.shrink_to_fit();
+    }
+    return QT_STATUS_OK;
+}
+
+int qt_icl_prefix_cache_stats(struct qt_context * q, uint64_t * hits, uint64_t * misses) {
+    if (!q) {
+        if (hits) *hits = 0;
+        if (misses) *misses = 0;
+        return 0;
+    }
+    std::lock_guard<std::mutex> gpu(q->gpu_mu);
+    if (hits) *hits = q->pt.icl_prefix_hits;
+    if (misses) *misses = q->pt.icl_prefix_misses;
+    return (int) q->pt.icl_prefix_cache.size();
+}
+
 void qt_voice_ref_free(struct qt_voice_ref * ref) {
     if (!ref) {
         return;

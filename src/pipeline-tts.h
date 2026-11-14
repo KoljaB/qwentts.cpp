@@ -91,6 +91,18 @@ struct PromptCache {
     size_t                              max_prefix_entries;
 };
 
+// ICL prefix cache entry: the talker KV rows [0, rows) of one voice's
+// request independent ICL prefix (head plus reference text rows), kept
+// on the host. input_embed is the prefix it was computed from; a hit
+// requires it to match the new request bit for bit, so a restored
+// prefix is exactly what the prefill would have computed.
+struct IclPrefixEntry {
+    int                             rows = 0;
+    std::vector<float>              input_embed;  // [rows, hidden]
+    std::vector<std::vector<float>> k;            // per layer: [n_kv_heads][rows][head_dim]
+    std::vector<std::vector<float>> v;
+};
+
 // One set of static predictor graphs for a given batch width: the
 // frame graph replays the prefill and every acoustic step in one
 // compute. The sampler inputs and the codes accumulator live in their
@@ -156,6 +168,13 @@ struct PipelineTTS {
     std::vector<SpeakerEntry>  speakers;
     GenerationDefaults         gen_defaults;
     PromptCache                prompt_cache;
+
+    // ICL prefix cache, off by default (qt_set_icl_prefix_cache). Most
+    // recently used entry last; hits and misses count ICL admits only.
+    int                         icl_prefix_cache_max = 0;
+    std::vector<IclPrefixEntry> icl_prefix_cache;
+    uint64_t                    icl_prefix_hits   = 0;
+    uint64_t                    icl_prefix_misses = 0;
 
     BackendPair          bp;
     ggml_backend_t       backend;
