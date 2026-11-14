@@ -716,8 +716,8 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
             }
             return QT_STATUS_INVALID_PARAMS;
         }
-        if (mt != "base" || (!has_ref_audio && !has_lat_spk) || params->ref_text || params->ref_codes) {
-            qt_set_error("onset silence suppression is only valid for Base x-vector-only requests");
+        if (mt != "base" || (!has_ref_audio && !has_lat_spk)) {
+            qt_set_error("onset silence suppression is only valid for Base voice-clone requests");
             if (out) {
                 qt_audio_free(out);
             }

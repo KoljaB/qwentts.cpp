@@ -378,8 +378,11 @@ struct qt_tts_params {
 
     // Optional request-local suppression of known leading-silence c0
     // tokens. Disabled when all three fields are zero / NULL. When
-    // enabled, the library rejects non-Base, ICL, and non-x-vector
-    // requests instead of silently broadening the rule. The caller owns
+    // enabled, the library rejects non-Base requests and requests
+    // without a voice reference instead of silently broadening the
+    // rule. With a reference text (ICL) the model opens with a pause
+    // made of other tokens than without one, so the caller passes the
+    // id set that belongs to the request's mode. The caller owns
     // onset_silence_ids for the duration of qt_synthesize.
     const int32_t * onset_silence_ids;
     int             onset_silence_id_count;
