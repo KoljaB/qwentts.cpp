@@ -601,7 +601,7 @@ struct TtsEngine {
     int                  codec_M;          // active streaming lanes
     int                  codec_max_target = CODEC_STREAM_MAX_TARGET;
     int                  codec_target;     // current ramp chunk width
-    bool                 codec_target_repeated; // CPU ramp holds width 2 once
+    int                  codec_target_flushes; // flushes done at the current width
     int                  codec_pending_n;  // rows accumulated, < codec_target
     std::vector<int32_t> codec_pending;    // [row][lane][K] frame rows
     std::vector<uint8_t> codec_live;       // per lane: rows are real frames
@@ -623,7 +623,7 @@ TtsEngine * tts_engine_new(PipelineTTS * pt, BPETokenizer * tok) {
     const size_t maxT  = (size_t) (1 << (CODEC_STREAM_CLASSES - 1));
     e->codec_M               = 0;
     e->codec_target          = 1;
-    e->codec_target_repeated = false;
+    e->codec_target_flushes  = 0;
     e->codec_pending_n       = 0;
     e->codec_pending.assign(maxT * maxM * K, 0);
     e->codec_live.assign(maxM, 0);
@@ -817,7 +817,7 @@ static bool tts_engine_codec_admit(TtsEngine * e, TtsSlot * s) {
     s->codec_set       = set;
     e->codec_M               = set + 1;
     e->codec_target          = 1;
-    e->codec_target_repeated = false;
+    e->codec_target_flushes  = 0;
     e->codec_pending_n       = 0;
     return true;
 }
@@ -1600,16 +1600,23 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
             } else if (e->codec_pending_n >= e->codec_target) {
                 ok = tts_engine_codec_flush(e);
                 if (ok && e->codec_target < e->codec_max_target) {
+                    // The ramp holds a width for a few flushes before it
+                    // doubles. A reply opens with a pause the caller trims,
+                    // so the flush that carries the first word should come
+                    // as soon as that frame exists, not a whole wide chunk
+                    // later.
 #if defined(QWEN_CPU_ONLY) && QWEN_CPU_ONLY
-                    // CPU live playback benefits from one extra 2-frame
-                    // flush: the ramp is 1,2,2,4,4... and then stays at 4.
-                    // GPU builds retain the original 1,2,4,8 cadence.
-                    if (e->codec_target == 2 && !e->codec_target_repeated) {
-                        e->codec_target_repeated = true;
-                    } else
+                    // CPU: 1,2,2,4,4... and then stays at 4.
+                    const int hold = e->codec_target == 2 ? 2 : 1;
+#else
+                    // GPU: eight single frames, then 2,2,4,8,8...; a frame costs far less
+                    // than its 80 ms of audio, so the early single-frame
+                    // flushes are cheap.
+                    const int hold = e->codec_target == 1 ? 8 : e->codec_target == 2 ? 2 : 1;
 #endif
-                    {
+                    if (++e->codec_target_flushes >= hold) {
                         e->codec_target <<= 1;
+                        e->codec_target_flushes = 0;
                     }
                 }
             }
